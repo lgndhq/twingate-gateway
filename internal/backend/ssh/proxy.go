@@ -22,11 +22,16 @@ var errShuttingDown = errors.New("shutting down")
 // Timeout for connecting to the upstream SSH server.
 const upstreamConnTimeout = 10 * time.Second
 
+// servedConn is an SSH connection the proxy is serving, closed on shutdown.
+type servedConn interface {
+	close()
+}
+
 type Proxy struct {
 	mu sync.Mutex
 
 	// Map of all active SSH connections
-	connsMap map[*ConnPair]struct{}
+	connsMap map[servedConn]struct{}
 
 	// Wait group for active SSH connections
 	wg sync.WaitGroup
@@ -40,7 +45,7 @@ type Proxy struct {
 
 func NewProxy(config Config) *Proxy {
 	return &Proxy{
-		connsMap: map[*ConnPair]struct{}{},
+		connsMap: map[servedConn]struct{}{},
 		config:   config,
 	}
 }
@@ -148,6 +153,20 @@ func (p *Proxy) serveConn(ctx context.Context, conn frontend.Conn) error {
 		clientVersion: string(downstreamSSHConn.ClientVersion()),
 	}
 
+	if t, ok := p.config.tunnelFor(conn.GATClaims().Resource); ok {
+		// A tunnel has no upstream SSH server, so no upstream username.
+		sshCtx.username = ""
+
+		logger.Audit.Info("SSH tunnel connection established", zap.Any("ssh", sshCtx.baseFields()))
+
+		tunnelConn := newTunnelConn(logger.Audit, sshCtx, conn.GATClaims().User, downstreamConn, t)
+		p.serveTracked(tunnelConn, func() { tunnelConn.serve(ctx) })
+
+		logger.Audit.Info("SSH connection closed", zap.Any("ssh", sshCtx.withConnectionClose(tunnelConn.ChannelsOpened())))
+
+		return nil
+	}
+
 	upstreamConfig, err := p.config.GetUpstreamConfig(ctx, upstream)
 	if err != nil {
 		closeDownstreamSSH(downstreamConn, logger.Audit, sshCtx)
@@ -187,25 +206,29 @@ func (p *Proxy) serveConn(ctx context.Context, conn frontend.Conn) error {
 
 	sshConnPair := NewConnPair(logger, sshCtx, downstreamConn, upstreamConn, recorderFactory)
 
-	// Serve the SSH connection pair
-	p.wg.Add(1)
-	defer p.wg.Done()
-
-	p.mu.Lock()
-	p.connsMap[sshConnPair] = struct{}{}
-	p.mu.Unlock()
-
-	defer func() {
-		p.mu.Lock()
-		delete(p.connsMap, sshConnPair)
-		p.mu.Unlock()
-	}()
-
-	sshConnPair.serve()
+	p.serveTracked(sshConnPair, sshConnPair.serve)
 
 	logger.Audit.Info("SSH connection closed", zap.Any("ssh", sshCtx.withConnectionClose(sshConnPair.ChannelsOpened())))
 
 	return nil
+}
+
+// serveTracked runs serve, tracking conn so Shutdown can close it and wait for it to finish.
+func (p *Proxy) serveTracked(conn servedConn, serve func()) {
+	p.wg.Add(1)
+	defer p.wg.Done()
+
+	p.mu.Lock()
+	p.connsMap[conn] = struct{}{}
+	p.mu.Unlock()
+
+	defer func() {
+		p.mu.Lock()
+		delete(p.connsMap, conn)
+		p.mu.Unlock()
+	}()
+
+	serve()
 }
 
 func closeOnPanic(logger *zap.Logger, closeFn func()) {
