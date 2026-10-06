@@ -11,12 +11,15 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	"go.uber.org/zap"
 	"golang.org/x/crypto/ssh"
 
+	"gateway/internal/backend/postgres"
 	"gateway/internal/config"
 	"gateway/internal/token"
 )
@@ -64,6 +67,9 @@ type Config struct {
 
 	gatewayUsername string
 
+	// tunnels maps a lowercase resource address to the tunnel serving it.
+	tunnels map[string]*tunnel
+
 	sessionRecording *config.SessionRecordingConfig
 	logger           *zap.Logger
 }
@@ -101,6 +107,11 @@ func NewConfig(sessionRecordingConfig *config.SessionRecordingConfig, sshCfg *co
 		userCertTTL = defaultUserCertTTL
 	}
 
+	tunnels, err := newTunnels(sshCfg.Tunnels)
+	if err != nil {
+		return nil, err
+	}
+
 	return &Config{
 		caProvider:      caProvider,
 		hostCerts:       newHostCertManager(caProvider.gatewayHostCA(), hostPublicKey, hostSigner, hostCertTTL, logger),
@@ -108,10 +119,45 @@ func NewConfig(sessionRecordingConfig *config.SessionRecordingConfig, sshCfg *co
 		userPublicKey:   userPublicKey,
 		userCertTTL:     userCertTTL,
 		gatewayUsername: sshCfg.Gateway.Username,
+		tunnels:         tunnels,
 
 		sessionRecording: sessionRecordingConfig,
 		logger:           logger,
 	}, nil
+}
+
+func newTunnels(tunnelCfgs []config.SSHTunnelConfig) (map[string]*tunnel, error) {
+	tunnels := make(map[string]*tunnel, len(tunnelCfgs))
+
+	for _, tunnelCfg := range tunnelCfgs {
+		t := &tunnel{targets: make(map[string]TunnelHandler, len(tunnelCfg.Targets))}
+
+		for _, target := range tunnelCfg.Targets {
+			handler, err := postgres.NewHandler(target.Address, target.Postgres)
+			if err != nil {
+				return nil, fmt.Errorf("tunnel %q target %q: %w", tunnelCfg.Resource, target.Address, err)
+			}
+
+			// Clients may forward to the address or any alias; all reach the same handler.
+			for _, destination := range target.Destinations() {
+				host, portStr, err := net.SplitHostPort(destination)
+				if err != nil {
+					return nil, fmt.Errorf("tunnel %q target %q: %w", tunnelCfg.Resource, destination, err)
+				}
+
+				port, err := strconv.ParseUint(portStr, 10, 16)
+				if err != nil {
+					return nil, fmt.Errorf("tunnel %q target %q: %w", tunnelCfg.Resource, destination, err)
+				}
+
+				t.targets[tunnelTargetKey(host, uint32(port))] = handler
+			}
+		}
+
+		tunnels[strings.ToLower(tunnelCfg.Resource)] = t
+	}
+
+	return tunnels, nil
 }
 
 func (c *Config) GetDownstreamConfig(ctx context.Context, requestedHost string, resource token.Resource) (*ssh.ServerConfig, error) {
@@ -182,6 +228,13 @@ func (c *Config) GetUpstreamConfig(ctx context.Context, upstream upstream) (*ssh
 	}
 
 	return upstreamSSHConfig, nil
+}
+
+// tunnelFor returns the tunnel serving resource, if it is tunnel-only.
+func (c *Config) tunnelFor(resource token.Resource) (*tunnel, bool) {
+	t, ok := c.tunnels[strings.ToLower(resource.Address)]
+
+	return t, ok
 }
 
 func loadPrivateKey(file string) (ssh.Signer, error) {

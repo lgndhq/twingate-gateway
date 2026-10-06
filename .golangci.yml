@@ -111,6 +111,7 @@ linters:
             case: goCamel
             initialism-overrides:
               CA: true
+              IAM: true
 
 formatters:
   enable:
