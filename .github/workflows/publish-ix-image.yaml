@@ -1,0 +1,82 @@
+name: Publish IX image
+
+# Builds the gateway image and pushes it to LGND's Artifact Registry for the Innovation Exchange
+# gateway VM (lgnd-gcp: modules/innovation-exchange-gateway). Authenticates with Workload
+# Identity Federation; no service-account keys exist.
+#
+# Repository variables (values from lgnd-gcp's tofu outputs):
+#   WIF_PROVIDER         innovation_exchange_wif_provider
+#   WIF_SERVICE_ACCOUNT  innovation_exchange_gateway_publisher_sa
+#   IMAGE_REPOSITORY     innovation_exchange_gateway_image_repository
+
+on:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Test
+        run: go test -race ./cmd/... ./internal/...
+
+      # Dockerfile.goreleaser copies a prebuilt binary from $TARGETPLATFORM/.
+      - name: Build binary
+        env:
+          CGO_ENABLED: "0"
+          GOOS: linux
+          GOARCH: amd64
+        run: |
+          mkdir -p build/linux/amd64
+          go build -trimpath -ldflags "-s -w -X gateway/internal/util/version.Version=${GITHUB_SHA::12}" \
+            -o build/linux/amd64/gateway .
+          cp LICENSE build/
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.WIF_PROVIDER }}
+          service_account: ${{ vars.WIF_SERVICE_ACCOUNT }}
+
+      - name: Setup gcloud
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Build and push image
+        env:
+          IMAGE_REPOSITORY: ${{ vars.IMAGE_REPOSITORY }}
+        run: |
+          registry="${IMAGE_REPOSITORY%%/*}"
+          gcloud auth configure-docker "$registry" --quiet
+
+          tag="$IMAGE_REPOSITORY:sha-${GITHUB_SHA::12}"
+          docker buildx build --platform linux/amd64 -f Dockerfile.goreleaser \
+            --provenance=false --push -t "$tag" build
+
+          digest="$(docker buildx imagetools inspect "$tag" --format '{{json .Manifest}}' | jq -r .digest)"
+          {
+            echo "### Published"
+            echo
+            echo "Set \`innovation_exchange_gateway_image\` in lgnd-gcp to:"
+            echo
+            echo '```'
+            echo "$IMAGE_REPOSITORY@$digest"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

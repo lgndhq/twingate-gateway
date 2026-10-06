@@ -6,9 +6,12 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"regexp"
+	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -31,6 +34,12 @@ var (
 	ErrDuplicateTLSCert                 = errors.New("duplicate certificateFile")
 	ErrInvalidSSHKeyType                = errors.New("invalid SSH key type")
 	ErrNegativeTTL                      = errors.New("TTL must be non-negative")
+	ErrNegativeLength                   = errors.New("length must be non-negative")
+	ErrDuplicateTunnelResource          = errors.New("duplicate tunnel resource")
+	ErrDuplicateTunnelTarget            = errors.New("duplicate tunnel target address")
+	ErrInvalidTunnelTarget              = errors.New("invalid tunnel target")
+	ErrInvalidPostgresTLSMode           = errors.New("postgres tls mode must be 'verifyFull' or 'verifyCA'")
+	ErrInvalidAllowedDomain             = errors.New("invalid allowed domain")
 )
 
 // networkRegexp matches a twingate.network slug: 1-63 lowercase alphanumeric characters.
@@ -177,9 +186,63 @@ type KubernetesUpstream struct {
 }
 
 type SSHConfig struct {
-	Gateway SSHGatewayConfig `yaml:"gateway"`
-	CA      SSHCAConfig      `yaml:"ca"`
+	Gateway SSHGatewayConfig  `yaml:"gateway"`
+	CA      SSHCAConfig       `yaml:"ca"`
+	Tunnels []SSHTunnelConfig `yaml:"tunnels,omitempty"`
 }
+
+// SSHTunnelConfig makes an SSH resource tunnel-only: the Gateway serves the SSH connection itself,
+// without an upstream SSH server, and accepts only port-forwarding (direct-tcpip) channels to
+// Targets, each served by a protocol-aware proxy.
+type SSHTunnelConfig struct {
+	Resource string                  `yaml:"resource"` // Address of the Twingate SSH resource this tunnel serves
+	Targets  []SSHTunnelTargetConfig `yaml:"targets"`
+}
+
+// SSHTunnelTargetConfig is a destination clients may forward to through a tunnel. Exactly one
+// protocol must be set: raw TCP forwarding is not supported, so every stream is audited.
+type SSHTunnelTargetConfig struct {
+	Address  string                `yaml:"address"`           // host:port the Gateway dials, which clients may also forward to
+	Aliases  []string              `yaml:"aliases,omitempty"` // Other hosts clients may forward to on the same port. Matched by name, never resolved
+	Postgres *PostgresTargetConfig `yaml:"postgres,omitempty"`
+}
+
+// PostgresTargetConfig configures the PostgreSQL proxy for a tunnel target. The Gateway logs in to
+// the server as the Twingate user and records every query in the audit log.
+type PostgresTargetConfig struct {
+	Databases      []string           `yaml:"databases"` // Databases clients may connect to; the first is used when the client names none
+	TLS            PostgresTLSConfig  `yaml:"tls"`
+	Auth           PostgresAuthConfig `yaml:"auth"`
+	MaxQueryLength int                `yaml:"maxQueryLength,omitempty"` // Longest query text recorded in the audit log, in bytes. Defaults to 4096
+}
+
+// PostgresTLSConfig configures the Gateway's TLS connection to the PostgreSQL server, which is
+// always encrypted and verified.
+type PostgresTLSConfig struct {
+	Mode       string `yaml:"mode,omitempty"`       // verifyFull (default) or verifyCA
+	CAFile     string `yaml:"caFile,omitempty"`     // PEM bundle of CAs that sign the server certificate. Defaults to the system pool
+	ServerName string `yaml:"serverName,omitempty"` // Name verified in verifyFull mode. Defaults to the target host
+}
+
+// PostgresAuthConfig selects how the Gateway logs in to the PostgreSQL server. Exactly one method
+// must be set.
+type PostgresAuthConfig struct {
+	GCPIAM *PostgresGCPIAMAuthConfig `yaml:"gcpIAM,omitempty"`
+}
+
+// PostgresGCPIAMAuthConfig logs in to Cloud SQL as each Twingate user through IAM database
+// authentication. The Gateway obtains the user's access token through ServiceAccount, which must be
+// granted Google Workspace domain-wide delegation for the sqlservice.login scope.
+type PostgresGCPIAMAuthConfig struct {
+	ServiceAccount  string   `yaml:"serviceAccount"`
+	AllowedDomains  []string `yaml:"allowedDomains"`            // Email domains of Twingate users allowed to log in
+	CredentialsFile string   `yaml:"credentialsFile,omitempty"` // Defaults to Application Default Credentials
+}
+
+const (
+	PostgresTLSModeVerifyFull = "verifyFull"
+	PostgresTLSModeVerifyCA   = "verifyCA"
+)
 
 type SSHGatewayConfig struct {
 	Username        string               `yaml:"username"` // username for upstream connections
@@ -735,6 +798,154 @@ func (s *SSHConfig) Validate() error {
 
 	if err := s.CA.Validate(); err != nil {
 		return fmt.Errorf("ca: %w", err)
+	}
+
+	resources := make(map[string]struct{})
+
+	for i, tunnel := range s.Tunnels {
+		if err := tunnel.Validate(); err != nil {
+			return fmt.Errorf("tunnels[%d]: %w", i, err)
+		}
+
+		resource := strings.ToLower(tunnel.Resource)
+		if _, exists := resources[resource]; exists {
+			return fmt.Errorf("%w: %q", ErrDuplicateTunnelResource, tunnel.Resource)
+		}
+
+		resources[resource] = struct{}{}
+	}
+
+	return nil
+}
+
+func (t *SSHTunnelConfig) Validate() error {
+	if t.Resource == "" {
+		return fmt.Errorf("%w: resource", ErrRequired)
+	}
+
+	if len(t.Targets) == 0 {
+		return fmt.Errorf("%w: targets", ErrRequired)
+	}
+
+	destinations := make(map[string]struct{})
+
+	for i, target := range t.Targets {
+		if err := target.Validate(); err != nil {
+			return fmt.Errorf("targets[%d]: %w", i, err)
+		}
+
+		for _, destination := range target.Destinations() {
+			key := strings.ToLower(destination)
+			if _, exists := destinations[key]; exists {
+				return fmt.Errorf("%w: %q", ErrDuplicateTunnelTarget, destination)
+			}
+
+			destinations[key] = struct{}{}
+		}
+	}
+
+	return nil
+}
+
+// Destinations returns the host:port values clients may forward to for this target: its address,
+// then each alias on the address's port. It assumes the target is valid.
+func (t *SSHTunnelTargetConfig) Destinations() []string {
+	_, port, _ := net.SplitHostPort(t.Address)
+
+	destinations := []string{t.Address}
+	for _, alias := range t.Aliases {
+		destinations = append(destinations, net.JoinHostPort(alias, port))
+	}
+
+	return destinations
+}
+
+func (t *SSHTunnelTargetConfig) Validate() error {
+	host, port, err := net.SplitHostPort(t.Address)
+	if err != nil || host == "" {
+		return fmt.Errorf("%w: address must be host:port: %q", ErrInvalidTunnelTarget, t.Address)
+	}
+
+	portNumber, err := strconv.Atoi(port)
+	if err != nil || portNumber < 1 || portNumber > 65535 {
+		return fmt.Errorf("%w: address must be host:port with a port between 1 and 65535: %q", ErrInvalidTunnelTarget, t.Address)
+	}
+
+	for _, alias := range t.Aliases {
+		if net.ParseIP(alias) == nil && !HostnameRegexp.MatchString(alias) {
+			return fmt.Errorf("%w: invalid alias %q", ErrInvalidTunnelTarget, alias)
+		}
+	}
+
+	if t.Postgres == nil {
+		return fmt.Errorf("%w: postgres", ErrRequired)
+	}
+
+	if err := t.Postgres.Validate(); err != nil {
+		return fmt.Errorf("postgres: %w", err)
+	}
+
+	return nil
+}
+
+func (p *PostgresTargetConfig) Validate() error {
+	if len(p.Databases) == 0 {
+		return fmt.Errorf("%w: databases", ErrRequired)
+	}
+
+	if slices.Contains(p.Databases, "") {
+		return fmt.Errorf("%w: databases must not contain an empty name", ErrRequired)
+	}
+
+	if p.MaxQueryLength < 0 {
+		return fmt.Errorf("%w: maxQueryLength", ErrNegativeLength)
+	}
+
+	if err := p.TLS.Validate(); err != nil {
+		return fmt.Errorf("tls: %w", err)
+	}
+
+	if err := p.Auth.Validate(); err != nil {
+		return fmt.Errorf("auth: %w", err)
+	}
+
+	return nil
+}
+
+func (t *PostgresTLSConfig) Validate() error {
+	switch t.Mode {
+	case "", PostgresTLSModeVerifyFull, PostgresTLSModeVerifyCA:
+		return nil
+	default:
+		return fmt.Errorf("%w: %q", ErrInvalidPostgresTLSMode, t.Mode)
+	}
+}
+
+func (a *PostgresAuthConfig) Validate() error {
+	if a.GCPIAM == nil {
+		return fmt.Errorf("%w: gcpIAM", ErrRequired)
+	}
+
+	if err := a.GCPIAM.Validate(); err != nil {
+		return fmt.Errorf("gcpIAM: %w", err)
+	}
+
+	return nil
+}
+
+func (g *PostgresGCPIAMAuthConfig) Validate() error {
+	if g.ServiceAccount == "" {
+		return fmt.Errorf("%w: serviceAccount", ErrRequired)
+	}
+
+	if len(g.AllowedDomains) == 0 {
+		return fmt.Errorf("%w: allowedDomains", ErrRequired)
+	}
+
+	for _, domain := range g.AllowedDomains {
+		if !HostnameRegexp.MatchString(domain) {
+			return fmt.Errorf("%w: %q", ErrInvalidAllowedDomain, domain)
+		}
 	}
 
 	return nil

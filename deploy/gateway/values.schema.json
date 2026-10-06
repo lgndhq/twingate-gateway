@@ -243,6 +243,45 @@
           },
           "additionalProperties": false
         },
+        "tunnels": {
+          "type": "array",
+          "description": "Tunnel-only SSH resources. The Gateway serves the SSH connection itself, without an upstream SSH server, and accepts only port forwarding to each tunnel's targets, which it proxies with per-user login and query auditing.",
+          "items": {
+            "type": "object",
+            "properties": {
+              "resource": {
+                "type": "string",
+                "description": "Address of the Twingate SSH resource this tunnel serves."
+              },
+              "targets": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "address": {
+                      "type": "string",
+                      "description": "host:port the Gateway dials, which clients may also forward to."
+                    },
+                    "aliases": {
+                      "type": "array",
+                      "items": {"type": "string"},
+                      "description": "Other hosts clients may forward to on the same port. Matched by name, never resolved."
+                    },
+                    "postgres": {
+                      "type": "object",
+                      "description": "PostgreSQL proxy settings. See the Gateway's PostgresTargetConfig."
+                    }
+                  },
+                  "required": ["address", "postgres"],
+                  "additionalProperties": false
+                }
+              }
+            },
+            "required": ["resource", "targets"],
+            "additionalProperties": false
+          }
+        },
         "ca": {
           "type": "object",
           "description": "CA configuration. Exactly one of local or vault must be configured when SSH is enabled.",

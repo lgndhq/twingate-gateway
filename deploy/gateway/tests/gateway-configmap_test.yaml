@@ -284,6 +284,80 @@ tests:
               ca:
                 local:
                   privateKeyFile: "/etc/gateway/ssh/ca-private-key"
+  - it: should include SSH tunnels
+    set:
+      ssh:
+        ca:
+          local:
+            privateKey: "my-private-key"
+        tunnels:
+          - resource: "10.0.0.5"
+            targets:
+              - address: "10.0.0.5:5432"
+                aliases: ["db.example.dev"]
+                postgres:
+                  databases: ["app"]
+                  tls:
+                    mode: "verifyCA"
+                    caFile: "/etc/gateway/postgres/server-ca.pem"
+                  auth:
+                    gcpIAM:
+                      serviceAccount: "sql-login@project.iam.gserviceaccount.com"
+                      allowedDomains: ["example.com"]
+    asserts:
+      - equal:
+          path: data["config.yaml"]
+          value: |-
+            twingate:
+              network: "acme"
+              host: "twingate.com"
+
+            port: 8443
+            metricsPort: 9090
+
+            log:
+              sessionRecording:
+                segment:
+                  maxDuration: "5m"
+                  maxSize: "64KB"
+
+            tls:
+              certificates:
+                files:
+                  - certificateFile: "/etc/gateway/tls/0/tls.crt"
+                    privateKeyFile: "/etc/gateway/tls/0/tls.key"
+
+            ssh:
+              gateway:
+                username: "gateway"
+                key:
+                  type: "ed25519"
+                hostCertificate:
+                  ttl: "24h"
+                userCertificate:
+                  ttl: "5m"
+
+              ca:
+                local:
+                  privateKeyFile: "/etc/gateway/ssh/ca-private-key"
+
+              tunnels:
+                - resource: 10.0.0.5
+                  targets:
+                  - address: 10.0.0.5:5432
+                    aliases:
+                    - db.example.dev
+                    postgres:
+                      auth:
+                        gcpIAM:
+                          allowedDomains:
+                          - example.com
+                          serviceAccount: sql-login@project.iam.gserviceaccount.com
+                      databases:
+                      - app
+                      tls:
+                        caFile: /etc/gateway/postgres/server-ca.pem
+                        mode: verifyCA
   - it: should include SSH with Vault CA
     set:
       ssh:

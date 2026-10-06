@@ -13,7 +13,7 @@ Zero-trust access gateway bridging Twingate with L7 resources such as Kubernetes
 
 **Key Features**: TLS 1.3 mutual auth, K8s user impersonation, SSH certificate-based access, session recording, Prometheus metrics
 
-**Core Dependencies**: k8s.io/client-go, golang.org/x/crypto/ssh, github.com/golang-jwt/jwt, go.uber.org/zap, prometheus/client_golang
+**Core Dependencies**: k8s.io/client-go, golang.org/x/crypto/ssh, github.com/golang-jwt/jwt, github.com/jackc/pgx/v5 (pgconn/pgproto3), go.uber.org/zap, prometheus/client_golang
 
 ## Architecture
 
@@ -51,6 +51,7 @@ main.go → cmd/start.go → proxy.NewProxy() → proxy.Start()
 - `kubernetes/`: Kubernetes API proxy
 - `webapp/`: HTTP web app proxy with templated header rewriting
 - `ssh/`: SSH proxy
+- `postgres/`: PostgreSQL proxy for SSH tunnel targets
 
 **`internal/backend/kubernetes/`** - Kubernetes proxy:
 
@@ -70,6 +71,15 @@ main.go → cmd/start.go → proxy.NewProxy() → proxy.Start()
 - Local CA private key hot-reloads on file change (`key_reloader.go`)
 - Bidirectional channel forwarding to upstreams
 - Host certs (gateway→client) + User certs (gateway→upstream)
+- Tunnel-only resources (`ssh.tunnels`, `tunnel.go`): no upstream SSH server; the Gateway accepts only direct-tcpip channels to configured targets (address or alias, matched by name) and hands each stream to a protocol handler
+
+**`internal/backend/postgres/`** - PostgreSQL proxy behind SSH tunnels:
+
+- Logs in to the server as the Twingate user; client-sent user/password are ignored
+- Cloud SQL IAM auth: user access token via a service account with Workspace domain-wide delegation (`sqlservice.login` scope only), restricted to `allowedDomains`
+- Upstream TLS is mandatory (`verifyFull` or `verifyCA`); speaks protocol 3.0 upstream and negotiates clients down
+- Relays messages byte for byte; audit logs one record per round trip (statements, command tags, errors), never bound parameter values
+- Cancel requests forwarded only for live sessions owned by the same user
 
 ### Security Model
 
@@ -101,7 +111,8 @@ main.go → cmd/start.go → proxy.NewProxy() → proxy.Start()
 │   │   ├── httpproxy/      # Shared HTTP reverse-proxy core
 │   │   ├── kubernetes/     # K8s API proxy
 │   │   ├── webapp/         # Web app proxy
-│   │   └── ssh/            # SSH proxy
+│   │   ├── ssh/            # SSH proxy
+│   │   └── postgres/       # PostgreSQL proxy for SSH tunnels
 │   ├── token/              # GAT (JWT) parsing and claims
 │   ├── sessionrecorder/    # Asciicast terminal session recording
 │   ├── metrics/            # Prometheus
@@ -253,6 +264,8 @@ Conventional commits: `feat:`, `fix:`, `chore:`, `docs:`, `test:`, `refactor:`, 
 | K8s Proxy | `internal/backend/kubernetes/handler.go` |
 | Web App Proxy | `internal/backend/webapp/handler.go` |
 | SSH Proxy | `internal/backend/ssh/proxy.go` |
+| SSH Tunnels | `internal/backend/ssh/tunnel.go` |
+| Postgres Proxy | `internal/backend/postgres/handler.go` |
 | Helm | `deploy/gateway/` |
 
 All paths relative to project root.

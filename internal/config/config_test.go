@@ -2079,3 +2079,255 @@ func TestVaultAWSConfig_Validate(t *testing.T) {
 		})
 	}
 }
+
+func TestLoad_SSHTunnels(t *testing.T) {
+	yaml := `
+twingate:
+  network: "acme"
+ssh:
+  gateway:
+    username: "gateway"
+  ca:
+    local:
+      privateKeyFile: "ca.key"
+  tunnels:
+    - resource: "10.0.0.5"
+      targets:
+        - address: "10.0.0.5:5432"
+          aliases: ["db.example.dev"]
+          postgres:
+            databases: ["app"]
+            maxQueryLength: 1024
+            tls:
+              mode: "verifyCA"
+              caFile: "server-ca.pem"
+            auth:
+              gcpIAM:
+                serviceAccount: "dwd@project.iam.gserviceaccount.com"
+                allowedDomains: ["example.com"]
+`
+
+	tmpFile := filepath.Join(t.TempDir(), "config.yaml")
+	require.NoError(t, os.WriteFile(tmpFile, []byte(yaml), 0600))
+
+	cfg, err := Load(tmpFile)
+	require.NoError(t, err)
+	require.NotNil(t, cfg.SSH)
+	require.Len(t, cfg.SSH.Tunnels, 1)
+
+	tunnel := cfg.SSH.Tunnels[0]
+	assert.Equal(t, "10.0.0.5", tunnel.Resource)
+	require.Len(t, tunnel.Targets, 1)
+	assert.Equal(t, "10.0.0.5:5432", tunnel.Targets[0].Address)
+	assert.Equal(t, []string{"10.0.0.5:5432", "db.example.dev:5432"}, tunnel.Targets[0].Destinations())
+
+	pg := tunnel.Targets[0].Postgres
+	require.NotNil(t, pg)
+	assert.Equal(t, []string{"app"}, pg.Databases)
+	assert.Equal(t, 1024, pg.MaxQueryLength)
+	assert.Equal(t, PostgresTLSConfig{Mode: PostgresTLSModeVerifyCA, CAFile: "server-ca.pem"}, pg.TLS)
+	require.NotNil(t, pg.Auth.GCPIAM)
+	assert.Equal(t, "dwd@project.iam.gserviceaccount.com", pg.Auth.GCPIAM.ServiceAccount)
+	assert.Equal(t, []string{"example.com"}, pg.Auth.GCPIAM.AllowedDomains)
+
+	require.NoError(t, cfg.SSH.Validate())
+}
+
+func validTunnelTarget() SSHTunnelTargetConfig {
+	return SSHTunnelTargetConfig{
+		Address: "db.internal:5432",
+		Postgres: &PostgresTargetConfig{
+			Databases: []string{"app"},
+			Auth: PostgresAuthConfig{GCPIAM: &PostgresGCPIAMAuthConfig{
+				ServiceAccount: "dwd@project.iam.gserviceaccount.com",
+				AllowedDomains: []string{"example.com"},
+			}},
+		},
+	}
+}
+
+func TestSSHConfig_Validate_Tunnels(t *testing.T) {
+	sshConfig := func(tunnels ...SSHTunnelConfig) SSHConfig {
+		return SSHConfig{
+			Gateway: SSHGatewayConfig{Username: "gateway"},
+			CA:      SSHCAConfig{Local: &SSHCALocalConfig{PrivateKeyFile: "ca.key"}},
+			Tunnels: tunnels,
+		}
+	}
+
+	t.Run("distinct resources", func(t *testing.T) {
+		cfg := sshConfig(
+			SSHTunnelConfig{Resource: "db-a.internal", Targets: []SSHTunnelTargetConfig{validTunnelTarget()}},
+			SSHTunnelConfig{Resource: "db-b.internal", Targets: []SSHTunnelTargetConfig{validTunnelTarget()}},
+		)
+		assert.NoError(t, cfg.Validate())
+	})
+
+	t.Run("duplicate resource, case-insensitively", func(t *testing.T) {
+		cfg := sshConfig(
+			SSHTunnelConfig{Resource: "db.internal", Targets: []SSHTunnelTargetConfig{validTunnelTarget()}},
+			SSHTunnelConfig{Resource: "DB.internal", Targets: []SSHTunnelTargetConfig{validTunnelTarget()}},
+		)
+		assert.ErrorIs(t, cfg.Validate(), ErrDuplicateTunnelResource)
+	})
+
+	t.Run("invalid tunnel is reported with its index", func(t *testing.T) {
+		cfg := sshConfig(SSHTunnelConfig{Resource: "db.internal"})
+		err := cfg.Validate()
+		require.ErrorIs(t, err, ErrRequired)
+		assert.Contains(t, err.Error(), "tunnels[0]")
+	})
+}
+
+func TestSSHTunnelConfig_Validate(t *testing.T) {
+	withTarget := func(mutate func(*SSHTunnelTargetConfig)) SSHTunnelConfig {
+		target := validTunnelTarget()
+		mutate(&target)
+
+		return SSHTunnelConfig{Resource: "db.internal", Targets: []SSHTunnelTargetConfig{target}}
+	}
+
+	tests := []struct {
+		name        string
+		tunnel      SSHTunnelConfig
+		wantErr     error
+		errContains string
+	}{
+		{
+			name:   "valid",
+			tunnel: withTarget(func(*SSHTunnelTargetConfig) {}),
+		},
+		{
+			name: "valid with verifyCA and options",
+			tunnel: withTarget(func(target *SSHTunnelTargetConfig) {
+				target.Postgres.TLS = PostgresTLSConfig{Mode: PostgresTLSModeVerifyCA, CAFile: "ca.pem"}
+				target.Postgres.MaxQueryLength = 100
+			}),
+		},
+		{
+			name:        "missing resource",
+			tunnel:      SSHTunnelConfig{Targets: []SSHTunnelTargetConfig{validTunnelTarget()}},
+			wantErr:     ErrRequired,
+			errContains: "resource",
+		},
+		{
+			name:        "no targets",
+			tunnel:      SSHTunnelConfig{Resource: "db.internal"},
+			wantErr:     ErrRequired,
+			errContains: "targets",
+		},
+		{
+			name: "duplicate target address",
+			tunnel: SSHTunnelConfig{
+				Resource: "db.internal",
+				Targets:  []SSHTunnelTargetConfig{validTunnelTarget(), validTunnelTarget()},
+			},
+			wantErr: ErrDuplicateTunnelTarget,
+		},
+		{
+			name: "valid with aliases",
+			tunnel: withTarget(func(target *SSHTunnelTargetConfig) {
+				target.Aliases = []string{"ix-prod.example.dev", "127.0.0.1"}
+			}),
+		},
+		{
+			name:    "invalid alias",
+			tunnel:  withTarget(func(target *SSHTunnelTargetConfig) { target.Aliases = []string{"db.internal:5432"} }),
+			wantErr: ErrInvalidTunnelTarget,
+		},
+		{
+			name: "alias collides with another target's address",
+			tunnel: func() SSHTunnelConfig {
+				first := validTunnelTarget()
+				second := validTunnelTarget()
+				second.Address = "10.0.0.5:5432"
+				second.Aliases = []string{"DB.internal"}
+
+				return SSHTunnelConfig{Resource: "db.internal", Targets: []SSHTunnelTargetConfig{first, second}}
+			}(),
+			wantErr: ErrDuplicateTunnelTarget,
+		},
+		{
+			name:    "address without port",
+			tunnel:  withTarget(func(target *SSHTunnelTargetConfig) { target.Address = "db.internal" }),
+			wantErr: ErrInvalidTunnelTarget,
+		},
+		{
+			name:    "address with port zero",
+			tunnel:  withTarget(func(target *SSHTunnelTargetConfig) { target.Address = "db.internal:0" }),
+			wantErr: ErrInvalidTunnelTarget,
+		},
+		{
+			name:    "address with non-numeric port",
+			tunnel:  withTarget(func(target *SSHTunnelTargetConfig) { target.Address = "db.internal:pg" }),
+			wantErr: ErrInvalidTunnelTarget,
+		},
+		{
+			name:        "no protocol",
+			tunnel:      withTarget(func(target *SSHTunnelTargetConfig) { target.Postgres = nil }),
+			wantErr:     ErrRequired,
+			errContains: "postgres",
+		},
+		{
+			name:        "no databases",
+			tunnel:      withTarget(func(target *SSHTunnelTargetConfig) { target.Postgres.Databases = nil }),
+			wantErr:     ErrRequired,
+			errContains: "databases",
+		},
+		{
+			name:        "empty database name",
+			tunnel:      withTarget(func(target *SSHTunnelTargetConfig) { target.Postgres.Databases = []string{"app", ""} }),
+			wantErr:     ErrRequired,
+			errContains: "databases",
+		},
+		{
+			name:    "negative maxQueryLength",
+			tunnel:  withTarget(func(target *SSHTunnelTargetConfig) { target.Postgres.MaxQueryLength = -1 }),
+			wantErr: ErrNegativeLength,
+		},
+		{
+			name:    "invalid TLS mode",
+			tunnel:  withTarget(func(target *SSHTunnelTargetConfig) { target.Postgres.TLS.Mode = "insecure" }),
+			wantErr: ErrInvalidPostgresTLSMode,
+		},
+		{
+			name:        "no auth method",
+			tunnel:      withTarget(func(target *SSHTunnelTargetConfig) { target.Postgres.Auth.GCPIAM = nil }),
+			wantErr:     ErrRequired,
+			errContains: "gcpIAM",
+		},
+		{
+			name:        "gcpIAM without service account",
+			tunnel:      withTarget(func(target *SSHTunnelTargetConfig) { target.Postgres.Auth.GCPIAM.ServiceAccount = "" }),
+			wantErr:     ErrRequired,
+			errContains: "serviceAccount",
+		},
+		{
+			name:        "gcpIAM without allowed domains",
+			tunnel:      withTarget(func(target *SSHTunnelTargetConfig) { target.Postgres.Auth.GCPIAM.AllowedDomains = nil }),
+			wantErr:     ErrRequired,
+			errContains: "allowedDomains",
+		},
+		{
+			name: "gcpIAM with an email as an allowed domain",
+			tunnel: withTarget(func(target *SSHTunnelTargetConfig) {
+				target.Postgres.Auth.GCPIAM.AllowedDomains = []string{"user@example.com"}
+			}),
+			wantErr: ErrInvalidAllowedDomain,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.tunnel.Validate()
+			if tt.wantErr == nil {
+				assert.NoError(t, err)
+
+				return
+			}
+
+			require.ErrorIs(t, err, tt.wantErr)
+			assert.Contains(t, err.Error(), tt.errContains)
+		})
+	}
+}

@@ -135,6 +135,28 @@ ssh:
     #   upstreamHostCA:
     #     mount: ""
 
+  # Tunnel-only SSH resources. The Gateway serves the SSH connection itself, without an upstream
+  # SSH server, and accepts only port forwarding to each tunnel's targets. Each target is a
+  # PostgreSQL server: the Gateway logs in as the Twingate user and audits every query.
+  # Mount any caFile or credentialsFile with `volumes` and `volumeMounts`.
+  tunnels: []
+    # - resource: "10.0.0.5"  # Address of the Twingate SSH resource
+    #   targets:
+    #     - address: "10.0.0.5:5432"  # Server the Gateway dials
+    #       aliases: ["db.example.dev"]  # Other hosts clients may forward to (not resolved)
+    #       postgres:
+    #         databases: ["app"]  # The first is used when the client names none
+    #         maxQueryLength: 4096  # Longest query text recorded in the audit log, in bytes
+    #         tls:
+    #           mode: "verifyCA"  # verifyFull (default) or verifyCA
+    #           caFile: "/etc/gateway/postgres/server-ca.pem"
+    #         auth:
+    #           # Cloud SQL IAM database authentication. The service account needs Google
+    #           # Workspace domain-wide delegation for the sqlservice.login scope.
+    #           gcpIAM:
+    #             serviceAccount: "sql-login@project.iam.gserviceaccount.com"
+    #             allowedDomains: ["example.com"]
+
 webApp:
   enabled: false
 
