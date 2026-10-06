@@ -19,6 +19,10 @@ import (
 	"gateway/internal/token"
 )
 
+// globalRequestKeepalive is the global request OpenSSH-compatible clients send to check that the
+// connection is alive.
+const globalRequestKeepalive = "keepalive@openssh.com"
+
 // TunnelHandler serves one forwarded stream of a tunnel-only SSH resource. It closes the stream
 // before returning.
 type TunnelHandler interface {
@@ -91,7 +95,13 @@ func (t *tunnelConn) rejectGlobalRequest(req *ssh.Request) {
 	extra, _ := globalRequestLogFields(req.Type, req.Payload)
 	logger := t.logger.With(zap.Any("ssh", t.sshCtx.withGlobalRequest(req.Type, labelDownstream, labelUpstream, extra)))
 
-	logger.Warn("SSH global request rejected")
+	if req.Type == globalRequestKeepalive {
+		// Clients send these periodically; any reply, including this refusal, shows the connection
+		// is alive. Refusing is what OpenSSH servers do too.
+		logger.Debug("SSH keepalive")
+	} else {
+		logger.Warn("SSH global request rejected")
+	}
 
 	if err := req.Reply(false, nil); err != nil {
 		logger.Error("Failed to reply to global request", zap.Error(err))
