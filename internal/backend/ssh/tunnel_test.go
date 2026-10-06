@@ -216,3 +216,18 @@ func TestSSHResource_OffersOnlyHostCertificate(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "no common algorithm for host key")
 }
+
+func TestTunnel_AnswersKeepaliveQuietly(t *testing.T) {
+	core, logs := observer.New(zapcore.DebugLevel)
+	tc := startTunnelConn(t, zap.New(core))
+
+	ok, _, err := sendGlobalRequest(tc.client, globalRequestKeepalive, true, nil)(t)
+	require.NoError(t, err)
+	assert.False(t, ok, "keepalives get a refusal, as from OpenSSH")
+
+	require.Eventually(t, func() bool {
+		return logs.FilterMessage("SSH keepalive").Len() == 1
+	}, testTimeout, 10*time.Millisecond)
+
+	assert.Zero(t, logs.FilterLevelExact(zapcore.WarnLevel).Len(), "keepalives are not logged as warnings")
+}

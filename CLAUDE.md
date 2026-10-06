@@ -69,6 +69,7 @@ main.go → cmd/start.go → proxy.NewProxy() → proxy.Start()
 
 - SSH server with CA-signed certificates (local/Vault)
 - Local CA private key hot-reloads on file change (`key_reloader.go`)
+- Host key is generated at startup unless `ssh.gateway.hostKeyFile` is set; set it when clients pin the bare host key (tunnels), so restarts don't change it
 - Bidirectional channel forwarding to upstreams
 - Host certs (gateway→client) + User certs (gateway→upstream)
 - Tunnel-only resources (`ssh.tunnels`, `tunnel.go`): no upstream SSH server; the Gateway accepts only direct-tcpip channels to configured targets (address or alias, matched by name) and hands each stream to a protocol handler; tunnels also offer the bare host key alongside the host certificate, for clients like Beekeeper (Node ssh2) that cannot verify certificates

@@ -4,12 +4,18 @@
 package ssh
 
 import (
+	"crypto/ed25519"
+	"crypto/rand"
+	"encoding/pem"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
+	"golang.org/x/crypto/ssh"
 
 	gatewayconfig "gateway/internal/config"
 	"gateway/test/data"
@@ -216,4 +222,55 @@ func TestTOFUHostKey_AddressMismatch(t *testing.T) {
 	// Connection from different address should fail
 	err = tofu.checkHostKey("10.0.0.2:22", nil, key)
 	require.ErrorIs(t, err, errTOFUAddressMismatch)
+}
+
+func TestNewConfig_HostKeyFile(t *testing.T) {
+	_, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+
+	pemBlock, err := ssh.MarshalPrivateKey(privateKey, "")
+	require.NoError(t, err)
+
+	hostKeyFile := filepath.Join(t.TempDir(), "ssh-host.key")
+	require.NoError(t, os.WriteFile(hostKeyFile, pem.EncodeToMemory(pemBlock), 0o600))
+
+	newConfig := func(hostKeyFile string) (*Config, error) {
+		return NewConfig(nil, &gatewayconfig.SSHConfig{
+			Gateway: gatewayconfig.SSHGatewayConfig{Username: "gateway", HostKeyFile: hostKeyFile},
+			CA: gatewayconfig.SSHCAConfig{
+				Local: &gatewayconfig.SSHCALocalConfig{PrivateKeyFile: "../../../test/data/ssh/ca/ca"},
+			},
+		}, zap.NewNop())
+	}
+
+	t.Run("loaded key survives restarts", func(t *testing.T) {
+		first, err := newConfig(hostKeyFile)
+		require.NoError(t, err)
+
+		second, err := newConfig(hostKeyFile)
+		require.NoError(t, err)
+
+		wantPublicKey, err := ssh.NewPublicKey(privateKey.Public())
+		require.NoError(t, err)
+
+		assert.True(t, keysEqual(wantPublicKey, first.hostCerts.publicKey))
+		assert.True(t, keysEqual(wantPublicKey, second.hostCerts.publicKey))
+		assert.True(t, keysEqual(wantPublicKey, first.hostCerts.keySigner.PublicKey()))
+	})
+
+	t.Run("generated key differs per start", func(t *testing.T) {
+		first, err := newConfig("")
+		require.NoError(t, err)
+
+		second, err := newConfig("")
+		require.NoError(t, err)
+
+		assert.False(t, keysEqual(first.hostCerts.publicKey, second.hostCerts.publicKey))
+	})
+
+	t.Run("missing file", func(t *testing.T) {
+		_, err := newConfig(filepath.Join(t.TempDir(), "missing"))
+		require.ErrorIs(t, err, os.ErrNotExist)
+		assert.Contains(t, err.Error(), "failed to load gateway host key")
+	})
 }

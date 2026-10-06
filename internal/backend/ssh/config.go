@@ -86,9 +86,9 @@ func NewConfig(sessionRecordingConfig *config.SessionRecordingConfig, sshCfg *co
 		return nil, fmt.Errorf("invalid gateway key config: %w", err)
 	}
 
-	hostSigner, hostPublicKey, err := keyCfg.Generate(rand.Reader)
+	hostSigner, hostPublicKey, err := gatewayHostKey(sshCfg.Gateway.HostKeyFile, keyCfg)
 	if err != nil {
-		return nil, fmt.Errorf("failed to generate gateway host key: %w", err)
+		return nil, err
 	}
 
 	userSigner, userPublicKey, err := keyCfg.Generate(rand.Reader)
@@ -124,6 +124,27 @@ func NewConfig(sessionRecordingConfig *config.SessionRecordingConfig, sshCfg *co
 		sessionRecording: sessionRecordingConfig,
 		logger:           logger,
 	}, nil
+}
+
+// gatewayHostKey loads the Gateway's host key from file, or generates one when file is empty. A
+// generated key changes on every restart, which clients that pin the bare host key (rather than
+// trusting the host CA) report as a changed host key.
+func gatewayHostKey(file string, keyCfg keyConfig) (ssh.Signer, ssh.PublicKey, error) {
+	if file == "" {
+		signer, publicKey, err := keyCfg.Generate(rand.Reader)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to generate gateway host key: %w", err)
+		}
+
+		return signer, publicKey, nil
+	}
+
+	signer, err := loadPrivateKey(file)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to load gateway host key: %w", err)
+	}
+
+	return signer, signer.PublicKey(), nil
 }
 
 func newTunnels(tunnelCfgs []config.SSHTunnelConfig) (map[string]*tunnel, error) {

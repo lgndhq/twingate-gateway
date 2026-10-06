@@ -245,7 +245,8 @@ const (
 )
 
 type SSHGatewayConfig struct {
-	Username        string               `yaml:"username"` // username for upstream connections
+	Username        string               `yaml:"username"`              // username for upstream connections
+	HostKeyFile     string               `yaml:"hostKeyFile,omitempty"` // Private host key (OpenSSH or PEM), so the key survives restarts. Defaults to a key generated at startup
 	Key             SSHKeyConfig         `yaml:"key"`
 	HostCertificate SSHCertificateConfig `yaml:"hostCertificate"`
 	UserCertificate SSHCertificateConfig `yaml:"userCertificate"`

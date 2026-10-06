@@ -2087,6 +2087,7 @@ twingate:
 ssh:
   gateway:
     username: "gateway"
+    hostKeyFile: "ssh-host.key"
   ca:
     local:
       privateKeyFile: "ca.key"
@@ -2113,6 +2114,7 @@ ssh:
 	cfg, err := Load(tmpFile)
 	require.NoError(t, err)
 	require.NotNil(t, cfg.SSH)
+	assert.Equal(t, "ssh-host.key", cfg.SSH.Gateway.HostKeyFile)
 	require.Len(t, cfg.SSH.Tunnels, 1)
 
 	tunnel := cfg.SSH.Tunnels[0]
