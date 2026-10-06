@@ -184,6 +184,14 @@ func (c *Config) GetDownstreamConfig(ctx context.Context, requestedHost string, 
 
 	downstreamSSHConfig.AddHostKey(hostCertSigner)
 
+	// Tunnels serve database GUI clients whose SSH libraries cannot verify host certificates, such
+	// as Node's ssh2 in Beekeeper Studio, so also offer the bare host key. Clients that support
+	// certificates list those algorithms first and still get the certificate. Either way the client
+	// has already authenticated the Gateway through Twingate's TLS connection.
+	if _, ok := c.tunnelFor(resource); ok {
+		downstreamSSHConfig.AddHostKey(c.hostCerts.keySigner)
+	}
+
 	return downstreamSSHConfig, nil
 }
 

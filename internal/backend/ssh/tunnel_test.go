@@ -6,6 +6,7 @@ package ssh
 import (
 	"context"
 	"io"
+	"net"
 	"sync"
 	"testing"
 	"time"
@@ -152,4 +153,66 @@ func TestTunnel_RejectsEverythingElse(t *testing.T) {
 	})
 
 	assert.Empty(t, handler.servedUsers())
+}
+
+// dialPlainHostKey completes an SSH handshake over conn as a client that cannot verify host
+// certificates, returning the host key the server presented.
+func dialPlainHostKey(t *testing.T, conn net.Conn) (ssh.PublicKey, error) {
+	t.Helper()
+
+	var hostKey ssh.PublicKey
+
+	clientConfig := &ssh.ClientConfig{
+		User:              "beekeeper",
+		HostKeyAlgorithms: []string{ssh.KeyAlgoED25519},
+		HostKeyCallback: func(_ string, _ net.Addr, key ssh.PublicKey) error {
+			hostKey = key
+
+			return nil
+		},
+		Timeout: testTimeout,
+	}
+
+	sshConn, channels, requests, err := ssh.NewClientConn(conn, net.JoinHostPort(testRequestedHost, "22"), clientConfig)
+	if err != nil {
+		return nil, err
+	}
+
+	client := ssh.NewClient(sshConn, channels, requests)
+
+	t.Cleanup(func() { _ = client.Close() })
+
+	return hostKey, nil
+}
+
+func TestTunnel_OffersPlainHostKey(t *testing.T) {
+	sshProxy := newTestProxy(t)
+	sshProxy.config.tunnels = map[string]*tunnel{
+		testResourceAddress: {targets: map[string]TunnelHandler{}},
+	}
+
+	clientConn, serverConn := newDownstreamConn(t, "127.0.0.1:1")
+
+	go func() {
+		_ = sshProxy.serveConn(t.Context(), serverConn)
+	}()
+
+	// A client that cannot verify host certificates still connects, and is shown the Gateway's
+	// own host key: the key the certificates certify.
+	hostKey, err := dialPlainHostKey(t, clientConn)
+	require.NoError(t, err)
+	assert.True(t, keysEqual(sshProxy.config.hostCerts.publicKey, hostKey))
+}
+
+func TestSSHResource_OffersOnlyHostCertificate(t *testing.T) {
+	sshProxy := newTestProxy(t)
+	clientConn, serverConn := newDownstreamConn(t, "127.0.0.1:1")
+
+	go func() {
+		_ = sshProxy.serveConn(t.Context(), serverConn)
+	}()
+
+	_, err := dialPlainHostKey(t, clientConn)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "no common algorithm for host key")
 }
